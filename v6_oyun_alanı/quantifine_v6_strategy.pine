@@ -1,0 +1,186 @@
+// QuantiFine v6 - TradingView Strateji
+// Pivot Point R2/S2 Entry, S1/R1 Stop
+
+//@version=5
+strategy("QuantiFine v6 Pivot R2/S2", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.04)
+
+// ═══════════════════════════════════════════════════════════
+// AYARLAR
+// ═══════════════════════════════════════════════════════════
+grp1 = "═══ İndikatör Ayarları ═══"
+atrLength = input.int(14, "ATR Periyodu", group=grp1)
+adxLength = input.int(14, "ADX Periyodu", group=grp1)
+rsiLength = input.int(14, "RSI Periyodu", group=grp1)
+hurstLength = input.int(20, "Hurst Penceresi", group=grp1)
+zScoreLength = input.int(20, "Z-Score Penceresi", group=grp1)
+
+grp2 = "═══ Sinyal Eşikleri ═══"
+adxThreshold = input.float(20, "ADX Eşiği", group=grp2)
+zScoreLongThreshold = input.float(2.0, "Z-Score Long Eşiği", group=grp2)
+zScoreShortThreshold = input.float(-2.0, "Z-Score Short Eşiği", group=grp2)
+hurstReversionThreshold = input.float(0.48, "Hurst Reversion Eşiği (<)", group=grp2)
+hurstTrendThreshold = input.float(0.52, "Hurst Trend Eşiği (>)", group=grp2)
+atrDeadZoneMultiplier = input.float(0.5, "ATR Ölü Bölge Çarpanı", group=grp2)
+
+grp3 = "═══ Kelly Pozisyon Boyutu ═══"
+kellyWinRate = input.float(0.55, "Win Rate", minval=0.1, maxval=0.9, group=grp3)
+kellyAvgWin = input.float(1.5, "Avg Win Ratio", group=grp3)
+kellyAvgLoss = input.float(1.0, "Avg Loss Ratio", group=grp3)
+
+// ═══════════════════════════════════════════════════════════
+// İNDİKATÖR HESAPLAMALARI
+// ═══════════════════════════════════════════════════════════
+
+// ATR & ADX
+atrValue = ta.atr(atrLength)
+atrAvg = ta.sma(atrValue, 50)
+[diplus, diminus, adxValue] = ta.dmi(adxLength, adxLength)
+
+// RSI
+rsiValue = ta.rsi(close, rsiLength)
+
+// Z-Score
+zScoreMean = ta.sma(close, zScoreLength)
+zScoreStd = ta.stdev(close, zScoreLength)
+zScore = (close - zScoreMean) / zScoreStd
+
+// Hurst Üsteli
+hurstCalc() =>
+    float sumTau = 0.0
+    int count = 0
+    for lag = 2 to 10
+        diff = close - close[lag]
+        stdDiff = ta.stdev(diff, hurstLength)
+        if stdDiff > 0
+            sumTau := sumTau + math.sqrt(stdDiff)
+            count := count + 1
+    avgTau = count > 0 ? sumTau / count : 0.5
+    math.max(0.01, math.min(0.99, avgTau / 10))
+
+hurstValue = hurstCalc()
+
+// ═══════════════════════════════════════════════════════════
+// S/R REFERANSLARI (DONCHIAN 50)
+// ═══════════════════════════════════════════════════════════
+// Düz çizgiler için Rolling 50 High/Low
+res = ta.highest(high, 50)[1]
+sup = ta.lowest(low, 50)[1]
+mid = (res + sup) / 2
+
+// Görselleştirme
+plot(res, "Resistance", color=color.green, linewidth=1)
+plot(sup, "Support", color=color.red, linewidth=1)
+plot(mid, "Mid Line", color=color.gray, linewidth=1)
+
+// ═══════════════════════════════════════════════════════════
+// KELLY CRİTERİON
+// ═══════════════════════════════════════════════════════════
+kellyFraction() =>
+    r = kellyAvgWin / kellyAvgLoss
+    kelly = kellyWinRate - ((1 - kellyWinRate) / r)
+    math.max(0.01, math.min(0.25, kelly * 0.5))
+
+positionSize = kellyFraction() * 100
+
+// ═══════════════════════════════════════════════════════════
+// SİNYAL HESAPLAMALARI
+// ═══════════════════════════════════════════════════════════
+
+isDeadZone = atrValue < (atrAvg * atrDeadZoneMultiplier)
+isReversionZone = hurstValue < hurstReversionThreshold
+isTrendZone = hurstValue > hurstTrendThreshold
+
+// TREND Sinyalleri (Breakout)
+// Fiyat direnci kırarsa Long, desteği kırarsa Short
+trendLong = isTrendZone and rsiValue > 50 and adxValue > adxThreshold and close > res
+trendShort = isTrendZone and rsiValue < 50 and adxValue > adxThreshold and close < sup
+
+// REVERSION Sinyalleri (Fade / Dönüş)
+// Fiyat çok yüksekse (Z>2) dirençten dönünce Short (veya direnç üzerindeyken)
+// Fiyat çok düşükse (Z<-2) destekten dönünce Long
+reversionShort = isReversionZone and zScore > zScoreLongThreshold and adxValue > adxThreshold and close > res
+reversionLong = isReversionZone and zScore < zScoreShortThreshold and adxValue > adxThreshold and close < sup
+
+// Final Sinyaller
+longSignal = not isDeadZone and (reversionLong or trendLong)
+shortSignal = not isDeadZone and (reversionShort or trendShort)
+
+// ═══════════════════════════════════════════════════════════
+// TRAILING STOP MANTIĞI
+// ═══════════════════════════════════════════════════════════
+var float trailingStop = na
+
+// STRATEJİ GİRİŞ/ÇIKIŞ
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=positionSize, comment=reversionLong ? "Rev Long" : "Trend Long")
+    // Stop Belirleme
+    // Trend Long: Alt kanal (SUP) stop.
+    // Rev Long: Alt kanalın biraz altı (Esneklik payı)
+    trailingStop := reversionLong ? sup - (atrValue * 2) : sup
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=positionSize, comment=reversionShort ? "Rev Short" : "Trend Short")
+    // Stop Belirleme
+    // Trend Short: Üst kanal (RES) stop.
+    // Rev Short: Üst kanalın biraz üstü (Esneklik payı)
+    trailingStop := reversionShort ? res + (atrValue * 2) : res
+
+// Trailing Stop Güncelleme (Donchian Takibi)
+if strategy.position_size > 0
+    // Long pozisyonda stop (SUP) yukarı çıkabilir ama aşağı inmez
+    if sup > trailingStop
+        trailingStop := sup
+    
+    if close < trailingStop
+        strategy.close("Long", comment="Stop Hit")
+
+if strategy.position_size < 0
+    // Short pozisyonda stop (RES) aşağı inebilir ama yukarı çıkmaz
+    if res < trailingStop
+        trailingStop := res
+        
+    if close > trailingStop
+        strategy.close("Short", comment="Stop Hit")
+
+
+// Trailing Stop çizgisi
+plot(strategy.position_size != 0 ? trailingStop : na, "Trailing Stop", color=color.fuchsia, style=plot.style_stepline, linewidth=2)
+
+// Sinyal işaretleri
+plotshape(longSignal and strategy.position_size == 0, "Long", shape.triangleup, location.belowbar, color.lime, size=size.small)
+plotshape(shortSignal and strategy.position_size == 0, "Short", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+bgcolor(isDeadZone ? color.new(color.gray, 90) : na, title="Ölü Bölge")
+
+// ═══════════════════════════════════════════════════════════
+// BİLGİ PANELİ
+// ═══════════════════════════════════════════════════════════
+var table panel = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(panel, 0, 0, "QuantiFine v6 S/R", text_color=color.cyan, text_size=size.normal)
+    table.cell(panel, 1, 0, "DONCHIAN", text_color=color.yellow)
+    
+    table.cell(panel, 0, 1, "RES / SUP", text_color=color.white)
+    table.cell(panel, 1, 1, str.tostring(res, "#.##") + " / " + str.tostring(sup, "#.##"), text_color=color.yellow)
+    
+    table.cell(panel, 0, 2, "Hurst", text_color=color.white)
+    table.cell(panel, 1, 2, str.tostring(hurstValue, "#.##"), text_color=hurstValue > 0.5 ? color.green : color.orange)
+    
+    table.cell(panel, 0, 3, "Rejim", text_color=color.white)
+    table.cell(panel, 1, 3, isTrendZone ? "TREND" : "REVERSION", text_color=isTrendZone ? color.green : color.orange)
+    
+    table.cell(panel, 0, 4, "ADX", text_color=color.white)
+    table.cell(panel, 1, 4, str.tostring(adxValue, "#.#"), text_color=adxValue > adxThreshold ? color.green : color.gray)
+    
+    table.cell(panel, 0, 5, "RSI", text_color=color.white)
+    table.cell(panel, 1, 5, str.tostring(rsiValue, "#.#"), text_color=rsiValue > 50 ? color.green : color.red)
+    
+    table.cell(panel, 0, 6, "Z-Score", text_color=color.white)
+    table.cell(panel, 1, 6, str.tostring(zScore, "#.##"), text_color=zScore > 2 ? color.lime : zScore < -2 ? color.red : color.gray)
+    
+    table.cell(panel, 0, 7, "ATR Filter", text_color=color.white)
+    table.cell(panel, 1, 7, isDeadZone ? "ÖLÜ BÖLGE" : "AKTİF", text_color=isDeadZone ? color.gray : color.green)
+    
+    table.cell(panel, 0, 8, "Kelly %", text_color=color.white)
+    table.cell(panel, 1, 8, str.tostring(positionSize, "#.#") + "%", text_color=color.yellow)
